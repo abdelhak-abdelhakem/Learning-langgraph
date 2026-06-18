@@ -3,15 +3,15 @@ import os
 import glob
 from pydantic import BaseModel , Field , field_validator
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.document_loaders import UnstructuredMarkdownLoader
+from langchain_community.document_loaders import UnstructuredMarkdownLoader 
 from langchain_community.retrievers import BM25Retriever
 from langchain_classic.retrievers import EnsembleRetriever 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
-from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnablePassthrough
-from langchain_core.output_parsers import StrOutputParser
+from typing import TypedDict , List
+from langgraph.graph import StateGraph , START , END
 
 load_dotenv()
 
@@ -87,20 +87,47 @@ def get_or_create_vector_store(doc_chunks) -> Chroma:
 
     return vectorstore
 
-def create_rag_chain(vectorstore: Chroma,all_chunks):
-    chroma_retriever = vectorstore.as_retriever(
-        search_type="similarity",
-        search_kwargs={"k": vector_k}
-    )
 
-    all_docs = all_chunks
-    bm25_retriever = BM25Retriever.from_documents(all_docs)
-    bm25_retriever.k = bm25_k
+#graph
+    
+    
+class CVMatcherState (TypedDict):
+    question : str
+    context :  List
+    answer : JobMatch
 
-    ensemble_retriever = EnsembleRetriever(
-        retrievers=[bm25_retriever, chroma_retriever],
-        weights=retriever_weights
-    )
+chunks = load_and_split_docs(directory_path, chunk_size, chunk_overlap)
+vectorstore = get_or_create_vector_store(chunks)
+
+
+chroma_retriever = vectorstore.as_retriever(
+    search_type="similarity",
+    search_kwargs={"k": vector_k}
+)
+
+bm25_retriever = BM25Retriever.from_documents(chunks)
+bm25_retriever.k = bm25_k
+
+ensemble_retriever = EnsembleRetriever(
+    retrievers=[bm25_retriever, chroma_retriever],
+    weights=retriever_weights
+)
+
+
+def retrieve_profile_node(state : CVMatcherState) -> CVMatcherState:
+    """"""
+    question = state["question"]
+    docs = ensemble_retriever.invoke(question)
+    state["context"] = docs
+    return state
+
+
+
+def score_job_node(state : CVMatcherState)-> CVMatcherState:
+    """"""
+    question = state["question"]
+    context = state["context"]
+
     template = """You are a technical recruiter. Evaluate this candidate profile against the job description and return a structured assessment.
     
     Candidate Profile and Project Readme:
@@ -110,56 +137,40 @@ def create_rag_chain(vectorstore: Chroma,all_chunks):
     """
     prompt = PromptTemplate.from_template(template)
 
-    def format_docs(docs):
-        return "\n\n".join(doc.page_content for doc in docs)
 
-    rag_chain = (
-        {"context": ensemble_retriever | format_docs, "question": RunnablePassthrough()}
-        | prompt
-        | structured_llm
-    )
+    formatted_context = "\n\n".join(doc.page_content for doc in context)
+    rag_chain = prompt| structured_llm
+    state["answer"]= rag_chain.invoke({"context": formatted_context, "question": question})
+    return state
 
-    return rag_chain
+graph  = StateGraph(CVMatcherState)
+graph.add_node("retrieve_profile_node",retrieve_profile_node)
+graph.add_node("score_job_node",score_job_node)
+
+graph.add_edge(START,"retrieve_profile_node")
+graph.add_edge("retrieve_profile_node","score_job_node")
+graph.add_edge("score_job_node",END)
+
+app = graph.compile()
 
 
 
-
-# --- Execution ---
-if __name__ == "__main__":
-    print("1. Loading documents...")
-    chunks = load_and_split_docs(directory_path, chunk_size, chunk_overlap)
+job_postings = []
+for i in range(1, 4):
+    file_name = f"notebooks/docs/job{i}.md"
     
-    print(f"2. Building Vector Store with {len(chunks)} chunks...")
-    vectorstore = get_or_create_vector_store(chunks)
-    
-    print("3. Creating RAG Chain...")
-    chain = create_rag_chain(vectorstore,chunks)
-    
-    print("4. reading the jobs descreptions...")
-   
+    try:
+        with open(file_name, 'r', encoding='utf-8') as file:
+            content = file.read()
+            
+            
+            job_postings.append(content)
+            print(f"Successfully added {file_name} to job_postings.")
+            
+    except FileNotFoundError:
+        print(f"Warning: {file_name} was not found.")
+        job_postings.append(None)
 
-    job_postings = []
-    for i in range(1, 4):
-        file_name = f"notebooks/docs/job{i}.md"
-        
-        try:
-            with open(file_name, 'r', encoding='utf-8') as file:
-                content = file.read()
-                
-                
-                job_postings.append(content)
-                print(f"Successfully added {file_name} to job_postings.")
-                
-        except FileNotFoundError:
-            print(f"Warning: {file_name} was not found.")
-            job_postings.append(None)
-    
-    for i, job in enumerate(job_postings, 1):
-        result = chain.invoke(job)
-        print(f"\nJob {i} — Score: {result.match_score}/100")
-        print(f"Rationale: {result.rationale}")
-        print(f"Matched: {result.matched_skills}")
-        print(f"Missing: {result.missing_skills}\n")
-
-    
-    
+for i, job in enumerate(job_postings, 1):
+    final_state = app.invoke({"question": job})
+    print(final_state["answer"])
